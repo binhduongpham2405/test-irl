@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>IRL - Xem (OBS)</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: transparent; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; background: transparent; }
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline></video>
+
+<script>
+const v = document.getElementById('v');
+const KEY = new URLSearchParams(location.search).get('key') || '';
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+const DEFAULT_ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+
+let ws = null, pc = null, pending = [], remoteSet = false, pingTimer = null, stopped = false;
+let iceServers = DEFAULT_ICE;
+
+const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+function reset() {
+  if (pc) { pc.close(); pc = null; }
+  pending = [];
+  remoteSet = false;
+  v.srcObject = null; // video trong suốt -> OBS hiện lớp "Đang kết nối lại" bên dưới
+}
+
+async function loadIceConfig() {
+  try {
+    const r = await fetch('/config?key=' + encodeURIComponent(KEY));
+    if (r.ok) iceServers = (await r.json()).iceServers || DEFAULT_ICE;
+  } catch { iceServers = DEFAULT_ICE; }
+}
+
+function connect() {
+  if (stopped) return;
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    send({ type: 'viewer', key: KEY });
+    clearInterval(pingTimer);
+    pingTimer = setInterval(() => send({ type: 'ping' }), 20000); // giữ host miễn phí không ngủ
+  };
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === 'auth-failed') {
+      stopped = true; // sai key thì không thử lại
+      return;
+    }
+
+    if (msg.type === 'offer') {
+      reset();
+      pc = new RTCPeerConnection({ iceServers });
+      pc.ontrack = (ev) => { v.srcObject = ev.streams[0]; v.play().catch(() => {}); };
+      pc.onicecandidate = (ev) => { if (ev.candidate) send({ type: 'candidate', candidate: ev.candidate }); };
+      pc.onconnectionstatechange = () => {
+        if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) v.srcObject = null;
+      };
+
+      await pc.setRemoteDescription(msg.sdp);
+      remoteSet = true;
+      for (const c of pending) { try { await pc.addIceCandidate(c); } catch {} }
+      pending = [];
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'answer', sdp: pc.localDescription });
+
+    } else if (msg.type === 'candidate') {
+      if (pc && remoteSet) { try { await pc.addIceCandidate(msg.candidate); } catch {} }
+      else pending.push(msg.candidate);
+
+    } else if (msg.type === 'publisher-left') {
+      reset();
+    }
+  };
+
+  ws.onclose = () => {
+    clearInterval(pingTimer);
+    reset();
+    setTimeout(connect, 2000);
+  };
+}
+
+loadIceConfig().then(connect);
+</script>
+</body>
+</html>

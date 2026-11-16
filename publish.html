@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IRL - Phát</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
+  #wrap { padding: 12px; max-width: 560px; margin: auto; }
+  video { width: 100%; background: #000; border-radius: 8px; }
+  input, select, button { width: 100%; padding: 12px; margin-top: 8px; font-size: 16px; border-radius: 8px; border: 0; box-sizing: border-box; }
+  button { background: #e53935; color: #fff; font-weight: 700; }
+  button.stop { background: #555; }
+  #status { margin-top: 10px; font-size: 14px; opacity: .85; min-height: 20px; }
+  small { opacity: .6; display: block; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="preview" autoplay muted playsinline></video>
+  <input id="key" type="password" placeholder="Stream key" autocomplete="off">
+  <select id="cam">
+    <option value="environment">Camera sau</option>
+    <option value="user">Camera trước</option>
+  </select>
+  <select id="bitrate">
+    <option value="1500000">Bitrate 1.5 Mbps (mạng yếu)</option>
+    <option value="2500000" selected>Bitrate 2.5 Mbps</option>
+    <option value="4000000">Bitrate 4 Mbps (mạng tốt)</option>
+  </select>
+  <button id="go">BẮT ĐẦU PHÁT</button>
+  <div id="status"></div>
+  <small>Giữ màn hình luôn sáng và không chuyển sang app khác, nếu không trình duyệt sẽ ngừng phát.</small>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+const DEFAULT_ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+
+let ws = null, pc = null, stream = null, running = false, wakeLock = null, pingTimer = null;
+let iceServers = DEFAULT_ICE;
+
+try { $('key').value = localStorage.getItem('irlkey') || ''; } catch {}
+
+const setStatus = (t) => { $('status').textContent = t; };
+const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+async function acquireWakeLock() {
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (running && document.visibilityState === 'visible') acquireWakeLock();
+});
+
+async function loadIceConfig(key) {
+  try {
+    const r = await fetch('/config?key=' + encodeURIComponent(key));
+    if (r.ok) iceServers = (await r.json()).iceServers || DEFAULT_ICE;
+  } catch { iceServers = DEFAULT_ICE; }
+}
+
+async function start() {
+  const key = $('key').value.trim();
+  if (!key) { setStatus('Hãy nhập stream key trước.'); return; }
+  try { localStorage.setItem('irlkey', key); } catch {}
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: $('cam').value, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true },
+    });
+  } catch (err) {
+    setStatus('Không mở được camera/mic: ' + err.message);
+    return;
+  }
+
+  $('preview').srcObject = stream;
+  running = true;
+  $('go').textContent = 'DỪNG PHÁT';
+  $('go').className = 'stop';
+  acquireWakeLock();
+  setStatus('Đang kết nối tới server (lần đầu có thể mất ~1 phút nếu server đang ngủ)...');
+  await loadIceConfig(key);
+  connectWs();
+}
+
+function stop(message) {
+  running = false;
+  clearInterval(pingTimer);
+  if (pc) { pc.close(); pc = null; }
+  if (ws) { ws.close(); ws = null; }
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  $('preview').srcObject = null;
+  $('go').textContent = 'BẮT ĐẦU PHÁT';
+  $('go').className = '';
+  setStatus(message || 'Đã dừng.');
+}
+
+function connectWs() {
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    send({ type: 'publisher', key: $('key').value.trim() });
+    clearInterval(pingTimer);
+    pingTimer = setInterval(() => send({ type: 'ping' }), 20000); // giữ host miễn phí không ngủ
+  };
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'auth-failed') {
+      stop('Sai stream key.');
+    } else if (msg.type === 'ok') {
+      setStatus('Đã kết nối server. Đang chờ OBS mở nguồn...');
+    } else if (msg.type === 'viewer-ready') {
+      await makeOffer();
+    } else if (msg.type === 'answer' && pc) {
+      await pc.setRemoteDescription(msg.sdp);
+    } else if (msg.type === 'candidate' && pc) {
+      try { await pc.addIceCandidate(msg.candidate); } catch {}
+    }
+  };
+
+  ws.onclose = () => {
+    if (running) {
+      setStatus('Mất kết nối server, đang thử lại...');
+      setTimeout(() => { if (running) connectWs(); }, 2000);
+    }
+  };
+}
+
+async function makeOffer() {
+  if (!stream) return;
+  if (pc) pc.close();
+  pc = new RTCPeerConnection({ iceServers });
+  stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+
+  pc.onicecandidate = (e) => { if (e.candidate) send({ type: 'candidate', candidate: e.candidate }); };
+  pc.onconnectionstatechange = () => {
+    if (!pc) return;
+    const s = pc.connectionState;
+    if (s === 'connected') setStatus('🔴 Đang phát vào OBS');
+    else if (s === 'connecting') setStatus('Đang kết nối tới OBS...');
+    else if (s === 'disconnected') setStatus('Đang mất tín hiệu, chờ kết nối lại...');
+    else if (s === 'failed') setStatus('Không kết nối thẳng được tới OBS (do NAT/mạng). Cần cấu hình TURN, xem hướng dẫn.');
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  send({ type: 'offer', sdp: pc.localDescription });
+
+  try {
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    const p = sender.getParameters();
+    if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+    p.encodings[0].maxBitrate = Number($('bitrate').value);
+    await sender.setParameters(p);
+  } catch {}
+}
+
+$('go').onclick = () => (running ? stop() : start());
+</script>
+</body>
+</html>
