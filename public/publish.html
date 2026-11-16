@@ -5,32 +5,50 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IRL - Phát</title>
 <style>
+  * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
   #wrap { padding: 12px; max-width: 560px; margin: auto; }
-  video { width: 100%; background: #000; border-radius: 8px; }
-  input, select, button { width: 100%; padding: 12px; margin-top: 8px; font-size: 16px; border-radius: 8px; border: 0; box-sizing: border-box; }
+  video { width: 100%; max-height: 62vh; object-fit: contain; background: #000; border-radius: 8px; display: block; }
+  video.mirror { transform: scaleX(-1); } /* chỉ lật xem trước camera trước, luồng gửi đi không bị lật */
+  input, select, button { width: 100%; padding: 12px; margin-top: 8px; font-size: 16px; border-radius: 8px; border: 0; }
   button { background: #e53935; color: #fff; font-weight: 700; }
   button.stop { background: #555; }
+  button.sec { background: #1e88e5; }
+  button:disabled { opacity: .4; }
   #status { margin-top: 10px; font-size: 14px; opacity: .85; min-height: 20px; }
   small { opacity: .6; display: block; margin-top: 8px; }
+
+  /* Điện thoại xoay ngang: xem trước bên trái, điều khiển bên phải */
+  @media (orientation: landscape) and (max-height: 600px) {
+    #wrap { max-width: none; display: grid; grid-template-columns: 1.5fr 1fr; gap: 12px; align-items: start; }
+    video { max-height: calc(100vh - 24px); }
+  }
 </style>
 </head>
 <body>
 <div id="wrap">
   <video id="preview" autoplay muted playsinline></video>
-  <input id="key" type="password" placeholder="Stream key" autocomplete="off">
-  <select id="cam">
-    <option value="environment">Camera sau</option>
-    <option value="user">Camera trước</option>
-  </select>
-  <select id="bitrate">
-    <option value="1500000">Bitrate 1.5 Mbps (mạng yếu)</option>
-    <option value="2500000" selected>Bitrate 2.5 Mbps</option>
-    <option value="4000000">Bitrate 4 Mbps (mạng tốt)</option>
-  </select>
-  <button id="go">BẮT ĐẦU PHÁT</button>
-  <div id="status"></div>
-  <small>Giữ màn hình luôn sáng và không chuyển sang app khác, nếu không trình duyệt sẽ ngừng phát.</small>
+  <div id="ctrl">
+    <input id="key" type="password" placeholder="Stream key" autocomplete="off">
+    <select id="cam">
+      <option value="environment">Camera sau</option>
+      <option value="user">Camera trước</option>
+    </select>
+    <select id="res">
+      <option value="720">Độ phân giải 720p</option>
+      <option value="1080">Độ phân giải 1080p (nét hơn, cần mạng khỏe)</option>
+    </select>
+    <select id="bitrate">
+      <option value="1500000">Bitrate 1.5 Mbps (mạng yếu)</option>
+      <option value="2500000">Bitrate 2.5 Mbps</option>
+      <option value="4000000" selected>Bitrate 4 Mbps</option>
+      <option value="6000000">Bitrate 6 Mbps (mạng rất tốt)</option>
+    </select>
+    <button id="go">BẮT ĐẦU PHÁT</button>
+    <button id="flip" class="sec" disabled>🔄 ĐỔI CAMERA TRƯỚC / SAU</button>
+    <div id="status"></div>
+    <small>Giữ màn hình luôn sáng, không chuyển sang app khác. Muốn xoay ngang thì tắt "khóa xoay màn hình" của điện thoại rồi xoay máy, hình sẽ tự đổi hướng.</small>
+  </div>
 </div>
 
 <script>
@@ -38,13 +56,17 @@ const $ = (id) => document.getElementById(id);
 const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
 const DEFAULT_ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
 
-let ws = null, pc = null, stream = null, running = false, wakeLock = null, pingTimer = null;
+let ws = null, pc = null, stream = null, videoSender = null;
+let running = false, wakeLock = null, pingTimer = null;
 let iceServers = DEFAULT_ICE;
+let facing = 'environment';
+let lastPortrait = null, rotTimer = null, switching = false;
 
 try { $('key').value = localStorage.getItem('irlkey') || ''; } catch {}
 
 const setStatus = (t) => { $('status').textContent = t; };
 const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+const isPortrait = () => window.innerHeight > window.innerWidth;
 
 async function acquireWakeLock() {
   try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
@@ -60,25 +82,88 @@ async function loadIceConfig(key) {
   } catch { iceServers = DEFAULT_ICE; }
 }
 
+// ----- Camera -----
+function videoConstraints() {
+  const h = Number($('res').value);
+  const w = h === 1080 ? 1920 : 1280;
+  const portrait = isPortrait();
+  return {
+    facingMode: { ideal: facing },
+    width: { ideal: portrait ? h : w },
+    height: { ideal: portrait ? w : h },
+    frameRate: { ideal: 30 },
+  };
+}
+
+async function acquireVideoTrack() {
+  const s = await navigator.mediaDevices.getUserMedia({ video: videoConstraints() });
+  const track = s.getVideoTracks()[0];
+  try { track.contentHint = 'detail'; } catch {}
+  return track;
+}
+
+function updatePreview() {
+  const pv = $('preview');
+  pv.srcObject = stream;
+  pv.classList.toggle('mirror', facing === 'user');
+}
+
+// Thay track video đang chạy (đổi camera / đổi hướng / đổi độ phân giải) mà không ngắt kết nối
+async function replaceVideo() {
+  if (!running || !stream || switching) return;
+  switching = true;
+  $('flip').disabled = true;
+  const old = stream.getVideoTracks()[0];
+  try {
+    // Nhiều điện thoại không mở được 2 camera cùng lúc, nên tắt camera cũ trước
+    if (old) { old.stop(); stream.removeTrack(old); }
+    const track = await acquireVideoTrack();
+    stream.addTrack(track);
+    if (videoSender) await videoSender.replaceTrack(track);
+    lastPortrait = isPortrait();
+    updatePreview();
+    setStatus(pc && pc.connectionState === 'connected' ? '🔴 Đang phát vào OBS' : 'Đã đổi camera.');
+  } catch (err) {
+    setStatus('Không đổi được camera: ' + err.message);
+    // Thử bật lại camera trước đó để không mất hình
+    try {
+      facing = facing === 'user' ? 'environment' : 'user';
+      $('cam').value = facing;
+      const track = await acquireVideoTrack();
+      stream.addTrack(track);
+      if (videoSender) await videoSender.replaceTrack(track);
+      updatePreview();
+    } catch {}
+  } finally {
+    switching = false;
+    $('flip').disabled = !running;
+  }
+}
+
+// ----- Bắt đầu / dừng -----
 async function start() {
   const key = $('key').value.trim();
   if (!key) { setStatus('Hãy nhập stream key trước.'); return; }
   try { localStorage.setItem('irlkey', key); } catch {}
+  facing = $('cam').value;
 
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: $('cam').value, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    const audio = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true },
     });
+    const video = await acquireVideoTrack();
+    stream = new MediaStream([...audio.getAudioTracks(), video]);
   } catch (err) {
     setStatus('Không mở được camera/mic: ' + err.message);
     return;
   }
 
-  $('preview').srcObject = stream;
+  lastPortrait = isPortrait();
+  updatePreview();
   running = true;
   $('go').textContent = 'DỪNG PHÁT';
   $('go').className = 'stop';
+  $('flip').disabled = false;
   acquireWakeLock();
   setStatus('Đang kết nối tới server (lần đầu có thể mất ~1 phút nếu server đang ngủ)...');
   await loadIceConfig(key);
@@ -89,15 +174,18 @@ function stop(message) {
   running = false;
   clearInterval(pingTimer);
   if (pc) { pc.close(); pc = null; }
+  videoSender = null;
   if (ws) { ws.close(); ws = null; }
   if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
   $('preview').srcObject = null;
   $('go').textContent = 'BẮT ĐẦU PHÁT';
   $('go').className = '';
+  $('flip').disabled = true;
   setStatus(message || 'Đã dừng.');
 }
 
+// ----- Kết nối server -----
 function connectWs() {
   ws = new WebSocket(WS_URL);
 
@@ -130,11 +218,28 @@ function connectWs() {
   };
 }
 
+async function applySenderParams() {
+  if (!videoSender) return;
+  try {
+    const p = videoSender.getParameters();
+    if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+    p.encodings[0].maxBitrate = Number($('bitrate').value);
+    p.encodings[0].scaleResolutionDownBy = 1;   // không tự thu nhỏ hình
+    p.encodings[0].maxFramerate = 30;
+    p.degradationPreference = 'maintain-resolution'; // mạng yếu thì giảm fps trước, giữ độ nét
+    await videoSender.setParameters(p);
+  } catch {}
+}
+
 async function makeOffer() {
   if (!stream) return;
   if (pc) pc.close();
   pc = new RTCPeerConnection({ iceServers });
-  stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+  videoSender = null;
+  stream.getTracks().forEach((t) => {
+    const s = pc.addTrack(t, stream);
+    if (t.kind === 'video') videoSender = s;
+  });
 
   pc.onicecandidate = (e) => { if (e.candidate) send({ type: 'candidate', candidate: e.candidate }); };
   pc.onconnectionstatechange = () => {
@@ -149,17 +254,32 @@ async function makeOffer() {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   send({ type: 'offer', sdp: pc.localDescription });
-
-  try {
-    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
-    const p = sender.getParameters();
-    if (!p.encodings || !p.encodings.length) p.encodings = [{}];
-    p.encodings[0].maxBitrate = Number($('bitrate').value);
-    await sender.setParameters(p);
-  } catch {}
+  await applySenderParams();
 }
 
+// ----- Sự kiện giao diện -----
 $('go').onclick = () => (running ? stop() : start());
+
+$('flip').onclick = async () => {
+  facing = facing === 'user' ? 'environment' : 'user';
+  $('cam').value = facing;
+  await replaceVideo();
+};
+
+$('cam').onchange = () => { facing = $('cam').value; if (running) replaceVideo(); };
+$('res').onchange = () => { if (running) replaceVideo(); };
+$('bitrate').onchange = () => { if (running) applySenderParams(); };
+
+// Xoay điện thoại: lấy lại hình đúng hướng ngang/dọc
+function onRotate() {
+  if (!running) return;
+  clearTimeout(rotTimer);
+  rotTimer = setTimeout(() => {
+    if (isPortrait() !== lastPortrait) replaceVideo();
+  }, 500);
+}
+window.addEventListener('resize', onRotate);
+if (screen.orientation) screen.orientation.addEventListener('change', onRotate);
 </script>
 </body>
 </html>
